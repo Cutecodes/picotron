@@ -3,9 +3,11 @@ import torch.distributed as dist
 import contextlib
 from torch import nn
 from torch.autograd import Variable
+from torch.distributed._tensor import DTensor, DeviceMesh, distribute_tensor, Shard, Replicate
 
 from picotron.data_parallel.bucket import BucketManager
 import picotron.process_group_manager as pgm
+from contextlib import contextmanager
 
 class DataParallelNaive(nn.Module):
     """
@@ -58,6 +60,102 @@ class DataParallelNaive(nn.Module):
         self.require_backward_grad_sync = False
         yield
         self.require_backward_grad_sync = True
+
+class DataParallelZero3(nn.Module):
+    """
+    基于DTensor的ZeRO-3风格参数分片实现
+    核心改进：用DTensor自动管理参数分片
+    """
+
+    def __init__(self, module: nn.Module, shard_dim: int = 0):
+        super().__init__()
+
+        self.dp_rank = pgm.process_group_manager.dp_rank
+        self.dp_world_size = pgm.process_group_manager.dp_world_size
+
+        self.module = module
+        self.params = list(module.parameters())
+        # 参数分片, 按元素数分片，适合zero1和zero2
+
+        param_numels = [p.numel() for p in self.params]
+        total_numel = sum(param_numels)
+        # 计算每个rank应该分配的理想元素数量
+        target_numel_per_rank = total_numel // self.dp_world_size
+
+        # 基于元素数量进行分片
+        self.param_indices_per_rank = [[] for _ in range(self.dp_world_size)]
+        current_rank = 0
+        current_numel = 0
+        
+        for idx, numel in enumerate(param_numels):
+            # 如果当前rank已分配的元素数量超过目标，且不是最后一个rank，则移动到下一个rank
+            if current_numel + numel > target_numel_per_rank and current_rank < self.dp_world_size - 1:
+                current_rank += 1
+                current_numel = 0
+            
+            self.param_indices_per_rank[current_rank].append(idx)
+            current_numel += numel
+        
+
+        # 记录参数归属
+        self.param_to_rank = {}
+        for dp_rank in range(self.dp_world_size):
+            for param_indices in self.param_indices_per_rank[dp_rank]:
+                self.param_to_rank[param_indices] = dp_rank
+
+        self._shard_parameters()
+
+    def _shard_parameters(self):
+        """
+        参数分片保存
+        """
+        for idx, param in enumerate(self.params):
+            owner_rank = self.param_to_rank[idx]
+
+            # 保存完整参数形状
+            param._zero3_full_shape = param.data.shape
+            param._zero3_owner_rank = owner_rank
+
+            if self.dp_rank == owner_rank:
+                # Owner保留完整参数
+                param._zero3_full_param = param.data.clone()
+            else:
+                # 非owner释放参数显存
+                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                param._zero3_full_param = None
+    @contextmanager
+    def _gather_parameters(self):
+        """临时收集所有参数"""
+        try:
+            # All-Gather收集参数
+            for param in self.params:
+                owner_rank = param._zero3_owner_rank
+
+                # 恢复完整参数空间
+                if param.data.numel() == 0:
+                    param.data = torch.empty(
+                        param._zero3_full_shape,
+                        dtype=param.dtype,
+                        device=param.device
+                    )
+
+                # 广播参数
+                if self.dp_world_size > 1:
+                    dist.broadcast(param.data, src=owner_rank, group=pgm.process_group_manager.dp_group)
+
+            yield
+
+        finally:
+            # 释放非本地参数
+            for param in self.params:
+                if self.dp_rank != param._zero3_owner_rank:
+                    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+
+    def forward(self, *args, **kwargs):
+        """前向传播：自动聚合参数→计算→恢复分片"""
+        with self._gather_parameters():
+            return self.module(*args, **kwargs)
+    
 
 class DataParallelBucket(nn.Module):
     """
